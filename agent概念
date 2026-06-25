@@ -1,0 +1,143 @@
+# agent学习总结
+
+记录了agent的一些学习总结，路线：prompt工程-RAG-LangChain语法-agent智能体，并介绍了一些概念。
+
+## 目录
+
+[TOC]
+
+## 提示词工程
+
+1. **零样本 Zore-shot**
+
+   无提示，语言描述任务，依赖模型的预训练知识回答
+
+2. **少样本 Few-shot**
+
+   基于示例对齐模型的回答
+
+## RAG
+
+检索增强生成
+
+- 文本嵌入（向量化）——检索文档（知识库）
+- 提示词优化
+
+本质是`更为高级的提示词工程`
+
+![image-20260617162205315](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617162205315.png)
+
+**离线+在线**：
+
+- 离线：构建向量库
+- 在线：根据用户提问检索向量库的参考资料（相似度计算），将用户提问和参考资料拼接为提示词向模型提问，模型给出回答
+
+**作用：**
+
+- 知识时效性：模型的训练数据一定有截止时间，模型一定无法获得“未来”的数据信息，可以借助RAG来提供新的知识
+- 降低模型幻觉
+- 成本低
+
+## LangChain语法
+
+LangChain包含多种模型：LLMs、聊天模型和文本嵌入模型
+
+**LangChain的安装：**
+
+```bash
+pip install langchain langchain-community langchain-ollama dashscope chromadb
+```
+
+1. 提示词模板
+
+2. chain链
+
+   上一个组件的输出作为下一个组件的输入
+
+```python
+chain = prompt | model | p1 | ……
+```
+
+​	入链的组件必须是Runnable的子类，可以通过链调用 invoke() / stream() 触发整个链条的执行
+
+3. 文档加载器（BaseLoader）
+
+   先构造加载器，再用加载器调用加载方法
+
+4. 向量存储
+
+- 索引阶段
+- 查询阶段
+
+![image-20260617163824536](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617163824536.png)
+
+## agent智能体
+
+大语言模型LLM（大脑）+工具集（手脚）+决策逻辑（思维）
+
+![image-20260617164151045](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617164151045.png)
+
+**执行步骤：**
+
+（1）思考任务步骤；（2）选择合适工具；（3）执行工具调用；（4）根据工具的返回结果调整策略
+
+> 执行流程**动态**
+
+**ReAct行动框架(Reasoning + Acting)**
+
+- 思考 Reasoning
+
+- 行动 Action
+
+- 观察 Observation
+
+  整体按照“思考-行动-观察-再思考”的步骤进行执行，循环往复直到结束
+
+  LangChain的Agent对象遵循ReAct框架要求，在执行的过程中会持续的自我思考、自我行动、自我观察
+
+**Middleware中间件**
+
+​	对智能体的每一步工作进行控制和自定义的执行
+
+![image-20260617165247193](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617165247193.png)
+
+## 一些概念
+
+这里对一些常见的概念进行介绍，如MCP、Skill
+
+### MCP（Model Context Protocol）
+
+模型上下文协议，是AI应用连接外部工具、数据源、系统服务的标准协议
+
+> 用户问题
+> ↓
+> Agent
+> ↓
+> MCP Client   按MCP协议通信
+> ↓
+> MCP Server  	暴露工具、资源或提示词
+> ↓
+> Java SpringBoot 服务、RAG MCP
+
+### Agent Skill
+
+说明文档，是agent可以调用的一项可复用技能
+
+**渐进式披露**
+
+![image-20260617170323614](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617170323614.png)
+
+**执行流程**
+
+  用户                                                                       Agent                                                                   大模型
+
+![image-20260617170513733](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617170513733.png)
+
+一开始agent只会加载skill的元数据部分，相当于一个目录，然后由大模型根据用户需求来判断需要使用哪些技能，再由agent把相应的完整skill.md加载到上下文中，供大模型使用，根据skill中的指令完成用户的需求
+
+**截取一段网友的总结，感觉很好**：感觉Skill这个东西....朴素，没什么新意。Skill就相当于一个Agent，SKILL.md是提示词，script是工具，references是丐版RAG。整个机制就是一个路由+多专家智能体，路由决定激活哪个智能体，智能体再多轮生成。 值得一提的是Claude Code做了上下文共享，也就是上一轮Skill A的历史，在这一轮Skill B也能看到，这一点和多智能体不太一样，一般多智能体都是要隔离上下文的。
+
+### 区别
+
+![image-20260617171653956](C:\Users\l50058789\AppData\Roaming\Typora\typora-user-images\image-20260617171653956.png)
+
