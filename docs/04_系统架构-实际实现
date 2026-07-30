@@ -1,0 +1,227 @@
+# 系统架构文档
+
+---
+
+## 1. 系统定位
+
+代码仓退化识别 Agent 系统是一个基于 LLM 的智能分析工具，支持两种分析模式：
+
+1. **远程平台分析**：调用 CodeQualityShow 平台 API，获取代码质量聚合数据，生成退化分析报告
+2. **本地代码仓分析**：基于文件系统工具链，对本地代码仓库进行静态质量分析
+
+两种模式共享底层的会话 Agent（LangGraph 状态机）、工具注册表、上下文管理等基础设施。
+
+---
+
+## 2. 系统架构图
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                        main.py                           │
+│                    (CLI REPL 入口)                        │
+└───────────┬─────────────────────────┬───────────────────┘
+            │                         │
+            ▼                         ▼
+    ┌───────────────┐       ┌─────────────────────┐
+    │  ChatAgent    │       │ run_degradation_    │
+    │  (会话Agent)   │       │ analyze()           │
+    └───────┬───────┘       │ (退化分析工作流)      │
+            │               └──────────┬──────────┘
+            │                          │
+            ▼                          ▼
+    ┌───────────────┐       ┌─────────────────────┐
+    │ graph.py      │       │ DegradationAgent    │
+    │ LangGraph     │       │ (直接调用,非子Agent) │
+    │ 状态机工作流   │       └──────────┬──────────┘
+    └───────┬───────┘                  │
+            │                          ▼
+            │               ┌─────────────────────┐
+            │               │ MCPClient           │
+            │               │ (stdio 连接)         │
+            │               └──────────┬──────────┘
+            │                          │
+            ▼                          ▼
+    ┌───────────────┐       ┌─────────────────────┐
+    │ ToolRegistry  │       │ degradation_        │
+    │ (统一工具表)   │       │ mcp_server.py       │
+    └───────┬───────┘       │ (子进程)            │
+            │               └──────────┬──────────┘
+            │                          │
+    ┌───────┴──────────────────────────┴───────┐
+    │               原生工具                     │
+    │  filesystem.py / guardrails.py / etc.    │
+    └──────────────────────────────────────────┘
+```
+
+---
+
+## 3. 核心模块说明
+
+### 3.1 会话 Agent（ChatAgent / graph.py）
+
+**架构**：LangGraph StateGraph 硬编码状态机
+
+**图结构**：
+
+```
+START → append_user_msg → build_context → call_llm
+                                              ↓
+                          route_response → execute_tools → build_context (循环)
+                                        → final_answer → save_response → END
+                                        → save_response → END
+```
+
+**节点职责**：
+
+| 节点            | 职责                                               |
+| --------------- | -------------------------------------------------- |
+| append_user_msg | 输入防护（SQL注入拦截、PII检测）、增量追加到上下文 |
+| build_context   | 上下文压缩、api_messages 构建、失败缺口提示注入    |
+| call_llm        | 流式调用 LLM、提取 tool_calls                      |
+| execute_tools   | 工具分派、检索去重、冷却更新、预算消耗             |
+| final_answer    | 达到迭代上限时强制 LLM 基于已有数据输出            |
+| save_response   | 持久化、canary 检测、凭证/PII 脱敏                 |
+
+**检索防环机制**：
+
+- 去重：基于工具名+关键参数的 MD5 哈希，跨轮持久化（`search_called_tools`）
+- 预算：`search_iteration` 独立计数，list_files/grep/read_file/bash 每轮+1，上限 15 次
+
+**工具冷却**：
+
+- 触发：连续失败 2 次
+- 持续：2 轮
+- 效果：对 LLM 屏蔽该工具，冷却结束自动恢复
+
+### 3.2 退化分析工作流（DegradationAgent）
+
+**架构**：直接 Python 对象调用，非 LangGraph 子图
+
+**两阶段流水线**：
+
+#### 阶段 1：数据收集（规则驱动序列）
+
+```
+get_domain_info(type=1) → 获取域列表
+get_code_info(month, base_month) → 全域对比概览
+get_code_history(domains, month) → 12月历史趋势
+get_domain_detail(domain, dimension) → 按 group 下钻
+get_microservices(domain, month) → 微服务级数据
+get_code_review(month) → 代码审查统计
+```
+
+纯规则序列，无 LLM 参与。
+
+#### 阶段 2：报告生成（LLM 直出 JSON）
+
+- 将收集的数据拼成文本摘要，一次 LLM 调用（temperature=0，纯文本）
+- 从 LLM 输出中提取 JSON（支持截断修复）
+- 主进程完成报告校验和持久化
+
+**追问模式**：分析完成后，将报告摘要 + 已收集数据注入 ChatAgent，支持用户继续追问。
+
+### 3.3 统一工具注册表（ToolRegistry）
+
+- 合并管理原生 Python 工具与 MCP 工具
+- 统一 `get_all_tools()` 返回 OpenAI function-calling 格式
+- 统一 `call_tool()` 分派执行，瞬时错误自动重试（指数退避）
+
+### 3.4 本地代码分析工具链（filesystem.py）
+
+**三层检索**：
+
+1. `list_files` — glob 递归枚举，硬上限 100 条
+2. `grep` — 在指定文件列表内正则搜索，files 必填防止全仓爆炸
+3. `read_file` — 分页带行号输出
+
+**路径安全**：
+
+- 白名单（ALLOWED_ROOTS）默认为空，须 `add_allowed_path` 显式授权
+- 受保护目录（.git / .venv / __pycache__）永久拦截
+- 过宽路径（盘符根目录、用户主目录）拒绝授权
+
+**bash 工具**：
+
+- Windows 走 powershell
+- 只读 cmdlet 白名单
+- 危险操作（Remove-Item / Invoke-WebRequest / Invoke-Expression 等）硬禁
+
+### 3.5 上下文压缩（ContextManager）
+
+| 层   | 触发              | 策略                              |
+| ---- | ----------------- | --------------------------------- |
+| L1   | 单条 > 4000 token | 大结果落盘，投影进上下文          |
+| L2   | > 70% 窗口        | user+assistant 对替换为截断摘要   |
+| L3   | > 85% 窗口        | 从最旧 user-turn 起整段丢弃至 65% |
+| L4   | > 92% 窗口        | LLM 全量摘要                      |
+
+### 3.6 授权网关（ConfirmationGateway）
+
+- 文件系统写操作按风险分级（high/medium）
+- 执行前交互式确认
+- 支持会话级"始终允许"记忆
+
+---
+
+## 4. 调用链
+
+### 4.1 远程平台分析
+
+```
+用户输入 "analyze"
+    ↓
+main.py:240  run_degradation_analyze()
+    ↓
+main.py:412  new DegradationAgent(...)
+    ↓
+main.py:421  deg_agent.analyze(repo_path, month_from, month_to)
+    ↓
+    ├─ Phase 1: _collect_data() → mcp_client.call_tool(6个工具)
+    └─ Phase 2: _generate_report() → llm_client.chat()
+    ↓
+main.py:437  formatter.format_report()
+    ↓
+追问上下文注入 ChatAgent
+```
+
+### 4.2 本地代码分析
+
+```
+用户输入查询
+    ↓
+ChatAgent.chat()
+    ↓
+graph.invoke(initial_state)
+    ↓
+append_user_msg → build_context → call_llm → route_response
+                                              ↓
+                                        execute_tools (循环)
+                                              ↓
+                                        build_context
+                                              ↓
+                                        save_response → END
+```
+
+---
+
+## 5. MCP Server
+
+**文件**：`degradation_mcp_server.py`（项目根目录）
+
+**启动**：通过 `mcp_servers.json` 配置，由 `MCPClient` 以 stdio 方式启动子进程
+
+**封装工具**（6个）：
+
+- get_code_info / get_domain_info / get_domain_detail
+- get_code_history / get_microservices / get_code_review
+- submit_report（由主进程处理持久化）
+
+---
+
+## 6. 悬空代码
+
+| 模块                                                         | 状态                                         |
+| ------------------------------------------------------------ | -------------------------------------------- |
+| `chat_agent/degradation/skills.py`                           | 悬空（Skill/SKILLS 定义后从未使用）          |
+| `chat_agent/degradation/tool.py`                             | 悬空（DegradationAnalysisTool 未被注册）     |
+| `chat_agent/degradation/data_provider.py` DataProvider Protocol | 仅接口定义，实际使用 QualityPlatformProvider |
