@@ -1,0 +1,46 @@
+长期记忆流程实现
+所有代码文件写在chat_agent/memory/，除了在graph.py中加入load_memory节点并加入两条条件边
+1. 加载记忆 （load_memory节点）
+判断current_project（加到 ChatAgentState 里，在图节点间传递）是哪一个（a. 如果用户输入有平台关键词（平台，分发中台，算法中台，上架安全，增长中泰，联运，客户端，预装，push商业化，AppTouch，其他，生态），current_project是None（平台不存储记忆） b. 如果是刚才授权了项目目录，current_project是刚才新授权的项目目录 c. current_project保持不变），根据current_project获取该项目的记忆索引地址覆盖api_messages写记忆索引地址的地方 →
+让LLM（用ChatAgentState的model、temperature、max_tokens）根据记忆索引地址对应的md文件里的记忆地址对应的内容和用户输入选择最多5条记忆，覆盖api_messages写长期记忆的地方，不缓存
+
+2. fork agent （提取记忆和存储记忆）
+ChatAgent 实例持有一个内存队列和一个 daemon 后台线程，一次只处理一个任务，顺序执行。
+
+  入队时机：主 Agent 每轮 save_response 完成后，如果 current_project 不为 None，深拷贝list(context_manager._api_messages[_cur_turn_start:])截取本轮对话片段，连同current_project、model、temperature、max_tokens 一起作为快照放入队列（这些内容一起是一个快照）。入队在save_response节点之后增加一个节点执行。
+
+  后台线程处理流程：
+
+（1）fork_build_context：从队列中的快照构建 LLM 上下文。
+上下文：  - api_messages 当前轮片段（从 _cur_turn_start 截取，深拷贝）
+  		  - model、temperature、max_tokens
+读取 prompts/memory_extraction.txt 作为系统提示词；读取current_project记忆文件夹里的索引文件对应记忆全文（告诉LLM现有记忆，不要重复或者在什么记忆上更新），拼接在系统提示词之后；然后将快照中的本轮 api_messages 根据role转换为 system/user/assistant/tool 四种角色的 API 消息，对tool内容截断到 200 token。
+（2）fork_call_LLM：用快照中的 model、temperature、max_tokens 调用非流式 LLM，tools=None，HTTP 超时 60 秒。LLM 根据系统提示词规则和本轮对话内容，输出 JSON
+格式的记忆列表（每条包含 action=create/update、category、title、content、scope），无值得提取时返回空列表。
+（3）write_memory：解析 JSON，action=create 在 current_project/.agent_memory/{category}/ 下新建 md 文件并在索引中追加地址；action=update 直接更新已有文件的内容。
+（4）search_memory：对本轮写入的每条记忆，查索引文件中同 category 下是否有标题 normalize 后重复的，有则合并（保留内容更丰富的版本），无则保留新写入的。
+
+  异常处理：每个任务整体包裹在 try/except 中，单次任务失败时重试，最多 3 次，3 次仍失败则打印日志跳过。后台线程永远不会因为异常而死。
+  关闭：后台线程为 daemon 线程，主线程退出时自动终止。
+存储格式：
+Current_project / .agent_memory
+  # memory_index.md
+  ## user_feedback
+  - user_feedback/忽略generated目录.md
+  ## model_insight
+  - model_insight/Controller不直接调Repository.md
+3. LangGraph
+START
+→ append_user_msg（输入防护 + 追加用户消息到上下文）
+→ allowed_path里有目录：load_memory → build_context
+→ allowed_path里没有目录：build_context
+    → call_llm（调 LLM）
+    → route_response（条件分支）
+        ├─ execute_tools 
+→ add_allowed_path： load_memory → build_context
+→ 不是add_allowed_path：build_context
+        ├─ final_answer → save_response → END
+        └─ save_response → END
+注：allowed_path只保留一条，add_allowed_path之前清空allowed_path
+fork agent（后台独立运行）：
+  START → fork_build_context → fork_call_LLM → write_memory → search_memory→ END
