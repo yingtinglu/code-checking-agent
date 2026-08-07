@@ -1,2 +1,8 @@
 openai>=1.0.0
 mcp>=1.0.0
+httpx>=0.24.0
+tiktoken>=0.7.0
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langgraph-checkpoint-sqlite>=0.1.0
+python-dotenv>=1.0.0
